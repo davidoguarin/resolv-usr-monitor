@@ -65,7 +65,7 @@ st.markdown(
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 INITIAL_INVESTMENT = 50_000.0
-DEPEG_THRESHOLD    = 0.005          # ±0.5%
+DEPEG_THRESHOLD    = 0.010          # ±1.0%
 EXPLOIT_DATE       = pd.Timestamp("2026-03-22", tz="UTC")
 DATA_END           = pd.Timestamp("2026-03-24 23:59", tz="UTC")
 
@@ -199,7 +199,7 @@ def compute_triggers(
     upper  = 1.0 + DEPEG_THRESHOLD
     lower  = 1.0 - DEPEG_THRESHOLD
 
-    # ── Depeg: first hourly close outside ±0.5% band ─────────────────────────
+    # ── Depeg: first hourly close outside ±1.0% band ─────────────────────────
     depeg_dt = None
     depeg_label = ""
     for df in (h_v3, h_cu):
@@ -214,23 +214,22 @@ def compute_triggers(
                 depeg_dt    = t
                 depeg_label = f"Price ${p:.4f} (threshold ${lower:.3f})"
 
-    # ── Liquidity: 24h rolling volume doubles vs pre-window baseline ──────────
+    # ── Liquidity: 24h rolling volume doubles point-to-point ─────────────────
     liq_dt    = None
     liq_label = ""
     if not h_v3.empty:
-        w   = h_v3[h_v3["datetime"] >= cutoff].set_index("datetime").sort_index()
-        pre = h_v3[h_v3["datetime"] < cutoff]
-        if not pre.empty:
-            baseline = pre["volume_usd"].fillna(0).sum() / max(len(pre), 1)
-        else:
-            baseline = w["volume_usd"].fillna(0).mean()
-        baseline = max(baseline, 1.0)   # avoid divide-by-zero
-
+        w    = h_v3[h_v3["datetime"] >= cutoff].set_index("datetime").sort_index()
         roll = w["volume_usd"].fillna(0).rolling("24h", min_periods=1).sum()
-        spike = roll[roll > 2 * baseline * 24]   # 2× expected 24h volume
+        prev = roll.shift(1).fillna(0)
+        # Trigger: rolling sum ≥$5K AND more than doubles from previous hour
+        spike = roll[(roll >= 5_000) & (roll > 2 * prev)]
         if not spike.empty:
             liq_dt    = spike.index[0]
-            liq_label = f"24h vol ${spike.iloc[0]/1e3:.0f}K (2× baseline)"
+            prev_val  = float(prev.loc[spike.index[0]])
+            liq_label = (
+                f"24h vol ${spike.iloc[0]/1e3:.0f}K "
+                f"(×{spike.iloc[0]/max(prev_val,1):.0f} vs prev hour)"
+            )
 
     # ── Mint/Burn: hourly net outflow below threshold ─────────────────────────
     mb_dt    = None
@@ -409,11 +408,11 @@ def chart_depeg(h_v3: pd.DataFrame, h_cu: pd.DataFrame, days: int,
         ))
 
     fig.add_hline(y=upper, line_dash="dash", line_color=C_THRESH, line_width=1.2,
-                  annotation_text=f"+0.5%  ({upper:.3f})",
+                  annotation_text=f"+{DEPEG_THRESHOLD*100:.0f}%  ({upper:.3f})",
                   annotation_font_size=9, annotation_font_color=C_THRESH,
                   annotation_position="top right")
     fig.add_hline(y=lower, line_dash="dash", line_color=C_THRESH, line_width=1.2,
-                  annotation_text=f"−0.5%  ({lower:.3f})",
+                  annotation_text=f"−{DEPEG_THRESHOLD*100:.0f}%  ({lower:.3f})",
                   annotation_font_size=9, annotation_font_color=C_THRESH,
                   annotation_position="bottom right")
     fig.add_hline(y=1.0, line_dash="dot", line_color="#9ca3af", line_width=0.7)
@@ -443,8 +442,7 @@ def chart_depeg(h_v3: pd.DataFrame, h_cu: pd.DataFrame, days: int,
 
 
 def chart_liquidity(h_v3: pd.DataFrame, h_cu: pd.DataFrame, days: int,
-                    withdraw_dt: pd.Timestamp | None = None,
-                    baseline_2x: float | None = None) -> go.Figure:
+                    withdraw_dt: pd.Timestamp | None = None) -> go.Figure:
     cutoff = DATA_END - pd.Timedelta(days=days)
 
     def _trim_roll(df: pd.DataFrame) -> tuple:
@@ -474,16 +472,6 @@ def chart_liquidity(h_v3: pd.DataFrame, h_cu: pd.DataFrame, days: int,
             fill="tozeroy", fillcolor="rgba(124,58,237,0.06)",
             hovertemplate="<b>Curve: $%{y:.1f}K (24h)</b><extra></extra>",
         ))
-
-    # 2× baseline threshold line
-    if baseline_2x is not None:
-        fig.add_hline(
-            y=baseline_2x / 1e3,
-            line_dash="dash", line_color=C_THRESH, line_width=1.2,
-            annotation_text=f"2× baseline (${baseline_2x/1e3:.0f}K)",
-            annotation_font_size=9, annotation_font_color=C_THRESH,
-            annotation_position="top right",
-        )
 
     # "Withdraw funds" at first volume doubling
     if withdraw_dt is not None:
@@ -675,7 +663,7 @@ def main() -> None:
 
     r2c1, r2c2, r2c3, _ = st.columns([1, 1, 1, 1])
     with r2c1:
-        depegged = min_price < 0.995
+        depegged = min_price < 0.990
         st.markdown(kpi_card(
             "Min USR Price", f"${min_price:.4f}",
             "⚠ DEPEGGED" if depegged else "✓ In range",
@@ -696,14 +684,6 @@ def main() -> None:
     liq_dt,    _  = triggers["liquidity"]
     mb_dt,     _  = triggers["mint_burn"]
 
-    # Baseline for liquidity chart threshold line (2× expected 24h volume)
-    liq_baseline_2x: float | None = None
-    if not data["h_v3"].empty:
-        cutoff_h = DATA_END - pd.Timedelta(days=days)
-        pre = data["h_v3"][data["h_v3"]["datetime"] < cutoff_h]
-        base_hr = max(pre["volume_usd"].fillna(0).mean() if not pre.empty else 1.0, 1.0)
-        liq_baseline_2x = base_hr * 24 * 2   # 2× expected 24h volume
-
     # mint/burn threshold value for the chart line
     mb_threshold: float = -500_000
     if not data["mb_h"].empty:
@@ -723,7 +703,7 @@ def main() -> None:
     with col_r:
         st.plotly_chart(
             chart_liquidity(data["h_v3"], data["h_cu"], days,
-                            withdraw_dt=liq_dt, baseline_2x=liq_baseline_2x),
+                            withdraw_dt=liq_dt),
             use_container_width=True, config={"displayModeBar": False})
 
     st.plotly_chart(
