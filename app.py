@@ -81,8 +81,9 @@ C_EXPL   = "#6366f1"
 DATA_DIR = Path("data/cached")
 
 WINDOWS = {
-    "1 Week":  7,    # Mar 17–24
-    "3 Weeks": 21,   # Mar  3–24
+    "24 Hours":  1,   # Mar 23–24
+    "48 Hours":  2,   # Mar 22–24
+    "1 Week":    7,   # Mar 17–24
 }
 
 
@@ -141,6 +142,44 @@ def compute_nav(price_df: pd.DataFrame, apy_df: pd.DataFrame) -> pd.DataFrame:
     df["nav"] = navs
     df["drawdown"] = (df["nav"] / df["nav"].cummax() - 1.0) * 100.0
     return df
+
+
+@st.cache_data
+def compute_nav_hourly(
+    price_daily_df: pd.DataFrame,
+    price_hourly_df: pd.DataFrame,
+    apy_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Hourly NAV: bridge token count from the daily series, then compound hourly."""
+    if price_hourly_df.empty:
+        return pd.DataFrame(columns=["datetime", "nav", "drawdown"])
+
+    h = price_hourly_df.sort_values("datetime").copy()
+    first_price = float(h["close"].iloc[0]) or 1.0
+
+    # Find token count at the start of the hourly data from the daily series
+    nav_daily = compute_nav(price_daily_df, apy_df)
+    hourly_start_day = h["datetime"].min().normalize()
+    pre = nav_daily[nav_daily["date"] <= hourly_start_day]
+    if pre.empty:
+        tokens_start = INITIAL_INVESTMENT / first_price
+    else:
+        tokens_start = float(pre.iloc[-1]["nav"]) / first_price
+
+    # Map daily APY to each hourly candle
+    h["date"] = h["datetime"].dt.normalize()
+    h = h.merge(apy_df[["date", "apy"]], on="date", how="left")
+    h["apy"] = h["apy"].ffill().bfill().fillna(5.0)
+
+    tokens = tokens_start
+    navs: list[float] = []
+    for _, row in h.iterrows():
+        tokens *= 1.0 + row["apy"] / 100.0 / 8760.0   # 8 760 h / year
+        navs.append(tokens * row["close"])
+
+    h["nav"] = navs
+    h["drawdown"] = (h["nav"] / h["nav"].cummax() - 1.0) * 100.0
+    return h[["datetime", "nav", "drawdown"]].reset_index(drop=True)
 
 
 # ─── Trigger computation (shared across all charts + NAV summary) ─────────────
@@ -264,13 +303,17 @@ def _exploit_vline(fig: go.Figure, label: bool = True) -> None:
 # ─── Charts ───────────────────────────────────────────────────────────────────
 
 def chart_nav(nav_df: pd.DataFrame, triggers: dict) -> go.Figure:
+    # Support both daily ("date") and hourly ("datetime") DataFrames
+    x_col = "datetime" if "datetime" in nav_df.columns else "date"
+    hover_fmt = "%b %d %H:%M UTC" if x_col == "datetime" else "%b %d"
+
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=nav_df["date"], y=nav_df["nav"],
+        x=nav_df[x_col], y=nav_df["nav"],
         name="Portfolio NAV",
         line=dict(color=C_NAV, width=2),
         fill="tozeroy", fillcolor="rgba(22,163,74,0.08)",
-        hovertemplate="<b>NAV: $%{y:,.0f}</b><extra></extra>",
+        hovertemplate=f"<b>%{{x|{hover_fmt}}}<br>NAV: $%{{y:,.0f}}</b><extra></extra>",
     ))
     fig.add_hline(y=INITIAL_INVESTMENT, line_dash="dash", line_color="#9ca3af",
                   line_width=1.2, annotation_text="$50K entry",
@@ -552,15 +595,16 @@ def main() -> None:
     st.caption("$50K allocation · stUSR yield compounding · Oct 2025 – Apr 2026")
 
     # ── Load & compute ───────────────────────────────────────────────────────
-    data   = load_all()
-    nav_df = compute_nav(data["price"], data["apy"])
+    data       = load_all()
+    nav_daily  = compute_nav(data["price"], data["apy"])
+    nav_hourly = compute_nav_hourly(data["price"], data["h_v3"], data["apy"])
 
     # ── Window selector ──────────────────────────────────────────────────────
-    st.markdown("**Display window** (hourly resolution for price & liquidity)")
+    st.markdown("**Display window**")
     window = st.radio(
         "Display window",
         list(WINDOWS.keys()),
-        index=0,           # default: 1 Week
+        index=2,           # default: 1 Week
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -568,57 +612,85 @@ def main() -> None:
 
     st.markdown("---")
 
-    # ── KPI cards ────────────────────────────────────────────────────────────
-    cutoff_daily = DATA_END - pd.Timedelta(days=days)
-    nav_w   = nav_df[nav_df["date"] >= cutoff_daily]
+    # ── Compute triggers first (needed for NAV at Withdrawal KPI) ────────────
+    triggers = compute_triggers(data["h_v3"], data["h_cu"], data["mb_h"], days)
+
+    # Earliest trigger time across all signals
+    all_trigger_times = [v[0] for v in triggers.values() if v[0] is not None]
+    first_trigger_dt  = min(all_trigger_times) if all_trigger_times else None
+
+    # NAV at withdrawal: look up hourly NAV at first trigger time
+    nav_at_withdrawal: float | None = None
+    if first_trigger_dt is not None and not nav_hourly.empty:
+        idx = (nav_hourly["datetime"] - first_trigger_dt).abs().idxmin()
+        nav_at_withdrawal = float(nav_hourly.loc[idx, "nav"])
+
+    # ── Window-filtered slices ────────────────────────────────────────────────
+    cutoff_daily  = DATA_END - pd.Timedelta(days=days)
+    cutoff_hourly = DATA_END - pd.Timedelta(days=days)
+
+    nav_h_w = nav_hourly[nav_hourly["datetime"] >= cutoff_hourly]
     price_w = data["price"][data["price"]["date"] >= cutoff_daily]
     apy_w   = data["apy"][data["apy"]["date"]   >= cutoff_daily]
     tvl_w   = data["tvl"][data["tvl"]["date"]   >= cutoff_daily]
 
-    cur_nav   = float(nav_w["nav"].iloc[-1])          if len(nav_w) else INITIAL_INVESTMENT
-    peak_nav  = float(nav_df["nav"].max())             # lifetime peak, not window
-    max_dd    = float(nav_w["drawdown"].min())         if len(nav_w) else 0.0
-    min_price = float(price_w["close"].min())          if len(price_w) else 1.0
-    avg_apy   = float(apy_w["apy"].mean())             if len(apy_w) else 0.0
+    cur_nav   = float(nav_h_w["nav"].iloc[-1])   if len(nav_h_w) else INITIAL_INVESTMENT
+    peak_nav  = float(nav_daily["nav"].max())     # full-history peak
+    max_dd    = float(nav_h_w["drawdown"].min())  if len(nav_h_w) else 0.0
+    min_price = float(price_w["close"].min())     if len(price_w) else 1.0
+    avg_apy   = float(apy_w["apy"].mean())        if len(apy_w) else 0.0
     cur_tvl   = float(tvl_w["tvl_usd"].iloc[-1]) / 1e6 if len(tvl_w) else 0.0
 
     pnl     = cur_nav - INITIAL_INVESTMENT
     pnl_pct = pnl / INITIAL_INVESTMENT * 100
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    with c1:
+    # ── KPI cards — 2 rows ────────────────────────────────────────────────────
+    r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+    with r1c1:
         st.markdown(kpi_card(
             "Current NAV", f"${cur_nav:,.0f}",
             f"{'▲' if pnl>=0 else '▼'} ${abs(pnl):,.0f} ({pnl_pct:+.1f}%)",
             "pos" if pnl >= 0 else "neg",
         ), unsafe_allow_html=True)
-    with c2:
-        st.markdown(kpi_card("Peak NAV", f"${peak_nav:,.0f}"), unsafe_allow_html=True)
-    with c3:
+    with r1c2:
+        if nav_at_withdrawal is not None and first_trigger_dt is not None:
+            saved = nav_at_withdrawal - cur_nav
+            wlabel = f"at {first_trigger_dt.strftime('%b %d %H:%M')} UTC"
+            st.markdown(kpi_card(
+                "NAV at Withdrawal", f"${nav_at_withdrawal:,.0f}",
+                f"↳ saved ${saved:,.0f} vs holding",
+                "pos" if saved > 0 else "neu",
+            ), unsafe_allow_html=True)
+        else:
+            st.markdown(kpi_card("NAV at Withdrawal", "—", "No signal in window"),
+                        unsafe_allow_html=True)
+    with r1c3:
+        st.markdown(kpi_card("Peak NAV", f"${peak_nav:,.0f}",
+                             "lifetime high"), unsafe_allow_html=True)
+    with r1c4:
         st.markdown(kpi_card(
             "Max Drawdown", f"{max_dd:.1f}%", "from peak",
             "neg" if max_dd < -5 else "neu",
         ), unsafe_allow_html=True)
-    with c4:
+
+    r2c1, r2c2, r2c3, _ = st.columns([1, 1, 1, 1])
+    with r2c1:
         depegged = min_price < 0.995
         st.markdown(kpi_card(
             "Min USR Price", f"${min_price:.4f}",
             "⚠ DEPEGGED" if depegged else "✓ In range",
             "neg" if depegged else "pos",
         ), unsafe_allow_html=True)
-    with c5:
+    with r2c2:
         st.markdown(kpi_card(
             "Avg APY (stUSR)", f"{avg_apy:.1f}%", "Annualised yield",
         ), unsafe_allow_html=True)
-    with c6:
+    with r2c3:
         st.markdown(kpi_card(
             "Latest TVL", f"${cur_tvl:.1f}M", "Resolv protocol",
         ), unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
-
-    # ── Compute triggers (single pass, shared by all charts + NAV) ───────────
-    triggers = compute_triggers(data["h_v3"], data["h_cu"], data["mb_h"], days)
 
     depeg_dt,  _  = triggers["depeg"]
     liq_dt,    _  = triggers["liquidity"]
@@ -641,7 +713,7 @@ def main() -> None:
             mb_threshold = min(float(neg.mean() - 1.5 * neg.std()), -500_000)
 
     # ── Charts ────────────────────────────────────────────────────────────────
-    st.plotly_chart(chart_nav(nav_w, triggers), use_container_width=True,
+    st.plotly_chart(chart_nav(nav_h_w, triggers), use_container_width=True,
                     config={"displayModeBar": False})
 
     col_l, col_r = st.columns(2)
@@ -669,7 +741,7 @@ def main() -> None:
         "Data: DeFiLlama (TVL · stUSR APY) · GeckoTerminal (USR/USDC hourly OHLCV — "
         "Uniswap V3 & Curve, Mar 3–24 2026) · Etherscan (USR ERC-20 Transfer events, hourly) | "
         "Liquidity = 24h rolling volume (both pools) | "
-        "NAV = $50K ÷ USR price₀ → tokens compounded daily at stUSR APY × price"
+        "NAV = $50K ÷ USR price₀ → tokens bridged from daily to hourly compounding at stUSR APY"
     )
 
 
