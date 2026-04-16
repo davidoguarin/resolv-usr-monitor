@@ -623,16 +623,14 @@ def main() -> None:
         nav_at_withdrawal = float(nav_hourly.loc[idx, "nav"])
 
     # ── Window-filtered slices (centered on Mar 22 12:00 UTC) ────────────────
-    half      = pd.Timedelta(hours=days * 12)
-    w_low     = CENTER - half
-    w_high    = CENTER + half
-    w_low_d   = w_low.date()
-    w_high_d  = w_high.date()
+    half   = pd.Timedelta(hours=days * 12)
+    w_low  = CENTER - half
+    w_high = CENTER + half
 
     nav_h_w = nav_hourly[(nav_hourly["datetime"] >= w_low) & (nav_hourly["datetime"] <= w_high)]
-    price_w = data["price"][(data["price"]["date"] >= w_low_d) & (data["price"]["date"] <= w_high_d)]
-    apy_w   = data["apy"][(data["apy"]["date"]   >= w_low_d) & (data["apy"]["date"]   <= w_high_d)]
-    tvl_w   = data["tvl"][(data["tvl"]["date"]   >= w_low_d) & (data["tvl"]["date"]   <= w_high_d)]
+    price_w = data["price"][(data["price"]["date"] >= w_low) & (data["price"]["date"] <= w_high)]
+    apy_w   = data["apy"][(data["apy"]["date"]   >= w_low) & (data["apy"]["date"]   <= w_high)]
+    tvl_w   = data["tvl"][(data["tvl"]["date"]   >= w_low) & (data["tvl"]["date"]   <= w_high)]
 
     cur_nav   = float(nav_h_w["nav"].iloc[-1])   if len(nav_h_w) else INITIAL_INVESTMENT
     peak_nav  = float(nav_daily["nav"].max())     # full-history peak
