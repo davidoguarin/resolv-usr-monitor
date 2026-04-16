@@ -1,0 +1,7 @@
+# ~2-month hourly extract → data/hourly_two_month/ (does not touch data/raw).
+# Pools / tokens / apis: config/pools.yaml (merged at runtime).
+
+extraction:
+  start_date: "2026-01-24T00:00:00Z"
+  end_date: "2026-03-24T23:59:59Z"
+  output_dir: "data/hourly_two_month"

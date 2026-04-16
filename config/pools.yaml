@@ -1,0 +1,84 @@
+extraction:
+  start_date: "2026-03-20T00:00:00Z"
+  end_date: "2026-03-24T23:59:59Z"
+  interval_seconds: 300          # 5-minute OHLCV buckets
+  output_dir: "data/raw"
+
+tokens:
+  USDe:
+    address: "0x4c9edd5852cd905f086c759e8383e09bff1e68b3"
+    symbol: "USDe"
+    issuer: "Ethena"
+  USR:
+    address: "0x66a1e37c9b0eaddca17d3662d6c05f4decf3e110"
+    symbol: "USR"
+    issuer: "Resolv"
+  USDC:
+    address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+    symbol: "USDC"
+
+pools:
+  - id: usde_usdc_uniswap_v3
+    token: USDe
+    dex: uniswap_v3
+    chain: ethereum
+    address: "0xe6d7ebb9f1a9519dc06d557e03c522d53520e76a"
+    fee_tier: 100              # 0.01%
+    token0: "0x4c9edd5852cd905f086c759e8383e09bff1e68b3"   # USDe
+    token1: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"   # USDC
+    quote_is_token1: true      # price = token1Price (USDC per USDe)
+    rank: 1
+
+  - id: usde_usdc_curve
+    token: USDe
+    dex: curve
+    chain: ethereum
+    address: "0x02950460e2b9529d0e00284a5fa2d7bdf3fa4d72"
+    pool_name: "factory-stable-ng-12"
+    main_token: "0x4c9edd5852cd905f086c759e8383e09bff1e68b3"       # USDe (base)
+    reference_token: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"  # USDC (quote)
+    invert_price: false   # API returns USDC/USDe correctly for this pool
+    rank: 2
+    # Note: Curve prices API minimum resolution = 1 hour (step parameter is clamped)
+
+  - id: usr_usdc_uniswap_v3
+    token: USR
+    dex: uniswap_v3
+    chain: ethereum
+    address: "0x8bb9cd887dd51c5aa8d7da9e244c94bec035e47c"
+    fee_tier: 500              # 0.05%
+    token0: "0x66a1e37c9b0eaddca17d3662d6c05f4decf3e110"   # USR
+    token1: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"   # USDC
+    quote_is_token1: true      # price = token1Price (USDC per USR)
+    rank: 1
+
+  - id: usr_usdc_curve
+    token: USR
+    dex: curve
+    chain: ethereum
+    address: "0x3eE841F47947FEFbE510366E4bbb49e145484195"           # confirmed
+    pool_name: "factory-stable-ng-171"                              # USR/USDC
+    main_token: "0x66a1e37c9b0eaddca17d3662d6c05f4decf3e110"       # USR (base)
+    reference_token: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"  # USDC (quote)
+    invert_price: true    # API returns USR/USDC (coin0/coin1); invert to get USDC/USR
+    rank: 2
+    # Note: TVL ~$80K at time of extraction; prices API min resolution = 1 hour
+    # Verified: 1/api_price matches GeckoTerminal within 0.001 across all hourly candles
+
+apis:
+  thegraph:
+    # Free community endpoint (fallback — may be rate-limited)
+    uniswap_v3_url: "https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3"
+    # Decentralized network (preferred — requires API key in .env)
+    uniswap_v3_gateway: "https://gateway.thegraph.com/api/{api_key}/subgraphs/id/5zvR82QoaXYFyDEKLZ9t6v9adgnptxYpKpSbxtgVENFV"
+    page_size: 1000
+
+  curve:
+    prices_base_url: "https://prices.curve.finance/v1"
+    api_base_url: "https://api.curve.finance/v1"
+    chain: "ethereum"
+
+  rate_limits:
+    requests_per_second: 5
+    retry_attempts: 3
+    retry_backoff_seconds: 2
