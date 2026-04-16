@@ -214,16 +214,21 @@ def fetch_usr_price_daily() -> pd.DataFrame:
 
 # ─── 3b. USR/USDC Hourly OHLCV for 1W / 3W views (GeckoTerminal) ────────────
 
-# 3 weeks of hourly data ending Apr 1, 2026
-TS_HOURLY_START = 1773187200   # Mar 11, 2026 00:00 UTC
-TS_HOURLY_LIMIT = 514          # 504 h (21 days) + buffer
+# 3 weeks of hourly data ending Mar 24, 2026
+TS_HOURLY_START = 1772496000   # Mar  3, 2026 00:00 UTC  (3 weeks before Mar 24)
+TS_HOURLY_END   = 1774396800   # Mar 25, 2026 00:00 UTC  (exclusive)
+TS_HOURLY_LIMIT = 560          # 21 days × 24h + buffer
+
+# Ethereum block range for Mar 3–24, 2026 (≈12 s/block)
+BLOCK_3W_START = 24_565_000   # ~Mar  3 2026
+BLOCK_3W_END   = 24_740_000   # ~Mar 24 2026
 
 
 def _fetch_pool_hourly(pool_address: str, label: str) -> pd.DataFrame:
     """Fetch hourly OHLCV from GeckoTerminal for a single pool."""
     url = (
         f"{GECKO_BASE}/networks/eth/pools/{pool_address}/ohlcv/hour"
-        f"?aggregate=1&before_timestamp={TS_END + 3600}&limit={TS_HOURLY_LIMIT}"
+        f"?aggregate=1&before_timestamp={TS_HOURLY_END}&limit={TS_HOURLY_LIMIT}"
         f"&currency=usd&token=base"
     )
     try:
@@ -405,6 +410,58 @@ def fetch_usr_mint_burn() -> pd.DataFrame:
     return df
 
 
+# ─── 5. USR Mint / Burn — Hourly (3-week window ending Mar 24) ───────────────
+
+def fetch_usr_mint_burn_hourly() -> pd.DataFrame:
+    out = OUT_DIR / "usr_mint_burn_hourly.csv"
+    if out.exists():
+        log.info("usr_mint_burn_hourly.csv already cached — skipping.")
+        return pd.read_csv(out, parse_dates=["datetime"])
+
+    if not ETHERSCAN_KEY:
+        log.error("ETHERSCAN_API_KEY not set — skipping hourly mint/burn.")
+        return pd.DataFrame()
+
+    log.info("Fetching hourly USR mint/burn for 3-week window (blocks %d → %d) ...",
+             BLOCK_3W_START, BLOCK_3W_END)
+    mint_events = _fetch_transfers("mint", BLOCK_3W_START, BLOCK_3W_END)
+    burn_events = _fetch_transfers("burn", BLOCK_3W_START, BLOCK_3W_END)
+
+    def events_to_hourly(events: list[dict], col: str) -> pd.DataFrame:
+        rows = []
+        for ev in events:
+            try:
+                ts  = int(ev["timeStamp"], 16)
+                amt = _decode_transfer_amount(ev["data"])
+                # Floor to hour UTC
+                dt  = datetime.utcfromtimestamp(ts).replace(minute=0, second=0, microsecond=0)
+                rows.append({"datetime": dt.isoformat() + "Z", col: amt})
+            except Exception:
+                continue
+        if not rows:
+            return pd.DataFrame(columns=["datetime", col])
+        df = pd.DataFrame(rows)
+        df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(None)
+        return df.groupby("datetime")[col].sum().reset_index()
+
+    mints = events_to_hourly(mint_events, "minted")
+    burns = events_to_hourly(burn_events, "burned")
+
+    # Full hourly index (timezone-naive, consistent with event datetimes)
+    all_hours = pd.DataFrame({"datetime": pd.date_range(
+        "2026-03-03", "2026-03-24 23:00", freq="h"
+    )})
+    df = all_hours.merge(mints, on="datetime", how="left").merge(burns, on="datetime", how="left")
+    df["minted"] = df["minted"].fillna(0.0)
+    df["burned"] = df["burned"].fillna(0.0)
+    df["net"]    = df["minted"] - df["burned"]
+
+    df.to_csv(out, index=False)
+    log.info("  → %d hourly buckets (mints=%d events, burns=%d events).",
+             len(df), len(mint_events), len(burn_events))
+    return df
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -417,6 +474,7 @@ def main() -> None:
     fetch_usr_price_daily()
     fetch_usr_price_hourly()
     fetch_usr_mint_burn()
+    fetch_usr_mint_burn_hourly()
 
     log.info("All done — cached files in %s/", OUT_DIR)
 

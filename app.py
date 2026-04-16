@@ -67,7 +67,7 @@ st.markdown(
 INITIAL_INVESTMENT = 50_000.0
 DEPEG_THRESHOLD    = 0.005          # ±0.5%
 EXPLOIT_DATE       = pd.Timestamp("2026-03-22", tz="UTC")
-DATA_END           = pd.Timestamp("2026-04-01", tz="UTC")
+DATA_END           = pd.Timestamp("2026-03-24 23:59", tz="UTC")
 
 C_USR    = "#ea580c"
 C_CURVE  = "#7c3aed"
@@ -81,8 +81,8 @@ C_EXPL   = "#6366f1"
 DATA_DIR = Path("data/cached")
 
 WINDOWS = {
-    "1 Week":  7,
-    "3 Weeks": 21,
+    "1 Week":  7,    # Mar 17–24
+    "3 Weeks": 21,   # Mar  3–24
 }
 
 
@@ -98,24 +98,25 @@ def _read_daily(name: str) -> pd.DataFrame:
     return df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
 
 
-def _read_hourly(name: str) -> pd.DataFrame:
+def _read_hourly(name: str, dt_col: str = "datetime") -> pd.DataFrame:
     p = DATA_DIR / name
     if not p.exists():
         return pd.DataFrame()
-    df = pd.read_csv(p, parse_dates=["datetime"])
-    df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
-    return df.dropna(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
+    df = pd.read_csv(p, parse_dates=[dt_col])
+    df[dt_col] = pd.to_datetime(df[dt_col], utc=True)
+    return df.dropna(subset=[dt_col]).sort_values(dt_col).reset_index(drop=True)
 
 
 @st.cache_data
 def load_all() -> dict:
     return {
-        "tvl":   _read_daily("resolv_tvl.csv"),
-        "apy":   _read_daily("usr_apy.csv"),
-        "price": _read_daily("usr_price_daily.csv"),
-        "mb":    _read_daily("usr_mint_burn.csv"),
-        "h_v3":  _read_hourly("usr_price_hourly_v3.csv"),
-        "h_cu":  _read_hourly("usr_price_hourly_curve.csv"),
+        "tvl":    _read_daily("resolv_tvl.csv"),
+        "apy":    _read_daily("usr_apy.csv"),
+        "price":  _read_daily("usr_price_daily.csv"),
+        "mb":     _read_daily("usr_mint_burn.csv"),
+        "h_v3":   _read_hourly("usr_price_hourly_v3.csv"),
+        "h_cu":   _read_hourly("usr_price_hourly_curve.csv"),
+        "mb_h":   _read_hourly("usr_mint_burn_hourly.csv"),
     }
 
 
@@ -309,38 +310,76 @@ def chart_liquidity(h_v3: pd.DataFrame, h_cu: pd.DataFrame, days: int) -> go.Fig
     return fig
 
 
-def chart_mint_burn(mb_df: pd.DataFrame, days: int) -> go.Figure:
+def chart_mint_burn(mb_hourly: pd.DataFrame, days: int) -> go.Figure:
     cutoff = DATA_END - pd.Timedelta(days=days)
-    df = mb_df[mb_df["date"] >= cutoff].copy()
+    df = mb_hourly[mb_hourly["datetime"] >= cutoff].copy()
 
-    net_neg = df["net"][df["net"] < 0]
-    threshold = -(net_neg.abs().mean() + 2 * net_neg.abs().std()) if len(net_neg) > 2 else -10e6
+    if df.empty:
+        fig = go.Figure()
+        fig.update_layout(**_base_layout("USR Mint / Burn — Hourly", height=280))
+        return fig
+
+    # Threshold based on negative (outflow) hours only — ignores large mints
+    neg_flows = df["net"][df["net"] < 0]
+    if len(neg_flows) > 3:
+        threshold = float(neg_flows.mean() - 1.5 * neg_flows.std())
+        threshold = min(threshold, -500_000)   # floor: at least −500K USR/h
+    else:
+        threshold = -500_000
+
+    # Find first hour where net < threshold (withdraw signal)
+    breach = df[df["net"] < threshold]
+    withdraw_dt = breach["datetime"].iloc[0] if not breach.empty else None
 
     fig = go.Figure()
     fig.add_trace(go.Bar(
-        x=df["date"], y=df["minted"] / 1e6,
+        x=df["datetime"], y=df["minted"] / 1e6,
         name="Minted (USR)", marker_color=C_MINT, opacity=0.75,
-        hovertemplate="<b>Minted: %{y:.2f}M USR</b><extra></extra>",
+        hovertemplate="<b>%{x|%b %d %H:%M UTC}<br>Minted: %{y:.2f}M USR</b><extra></extra>",
     ))
     fig.add_trace(go.Bar(
-        x=df["date"], y=-df["burned"] / 1e6,
+        x=df["datetime"], y=-df["burned"] / 1e6,
         name="Burned (USR)", marker_color=C_BURN, opacity=0.75,
-        hovertemplate="<b>Burned: %{y:.2f}M USR</b><extra></extra>",
+        hovertemplate="<b>%{x|%b %d %H:%M UTC}<br>Burned: %{y:.2f}M USR</b><extra></extra>",
     ))
     fig.add_trace(go.Scatter(
-        x=df["date"], y=df["net"] / 1e6,
+        x=df["datetime"], y=df["net"] / 1e6,
         name="Net flow",
         line=dict(color="#111827", width=1.5),
-        hovertemplate="<b>Net: %{y:.2f}M USR</b><extra></extra>",
+        hovertemplate="<b>%{x|%b %d %H:%M UTC}<br>Net: %{y:.2f}M USR</b><extra></extra>",
     ))
-    fig.add_hline(y=threshold / 1e6, line_dash="dash", line_color=C_THRESH, line_width=1.2,
-                  annotation_text=f"Outflow alert ({threshold/1e6:.0f}M)",
-                  annotation_font_size=9, annotation_font_color=C_THRESH,
-                  annotation_position="bottom right")
+
+    # Threshold line
+    fig.add_hline(
+        y=threshold / 1e6,
+        line_dash="dash", line_color=C_THRESH, line_width=1.3,
+        annotation_text=f"Withdrawal trigger ({threshold/1e6:.1f}M USR/h)",
+        annotation_font_size=9, annotation_font_color=C_THRESH,
+        annotation_position="bottom right",
+    )
+
+    # "Withdraw funds" vertical marker at first breach
+    if withdraw_dt is not None:
+        fig.add_vline(
+            x=withdraw_dt.timestamp() * 1000,
+            line_color="#dc2626", line_width=2, line_dash="solid",
+        )
+        fig.add_annotation(
+            x=withdraw_dt.timestamp() * 1000,
+            y=0.97, yref="paper",
+            text="⚠ Withdraw funds",
+            showarrow=False,
+            font=dict(size=10, color="#dc2626", family="Inter, sans-serif"),
+            bgcolor="rgba(255,255,255,0.88)",
+            bordercolor="#dc2626", borderwidth=1,
+            xanchor="left", yanchor="top",
+            xshift=6,
+        )
+
     _exploit_vline(fig, label=False)
     fig.update_layout(
-        **_base_layout("USR Mint / Burn — Daily Net Flow (Etherscan Transfer Events)",
-                       height=280),
+        **_base_layout(
+            "USR Mint / Burn — Hourly Net Flow (Etherscan Transfer Events)", height=300),
         barmode="overlay",
     )
     fig.update_yaxes(ticksuffix="M USR")
@@ -375,7 +414,7 @@ def main() -> None:
     window = st.radio(
         "Display window",
         list(WINDOWS.keys()),
-        index=1,
+        index=0,           # default: 1 Week
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -448,14 +487,14 @@ def main() -> None:
     st.plotly_chart(chart_depeg(data["h_v3"], data["h_cu"], days),
                     use_container_width=True, config={"displayModeBar": False})
 
-    st.plotly_chart(chart_mint_burn(data["mb"], days),
+    st.plotly_chart(chart_mint_burn(data["mb_h"], days),
                     use_container_width=True, config={"displayModeBar": False})
 
     # ── Footer ────────────────────────────────────────────────────────────────
     st.markdown("---")
     st.caption(
         "Data: DeFiLlama (TVL · stUSR APY) · GeckoTerminal (USR/USDC hourly OHLCV — "
-        "Uniswap V3 & Curve) · Etherscan (USR ERC-20 Transfer events) | "
+        "Uniswap V3 & Curve, Mar 3–24 2026) · Etherscan (USR ERC-20 Transfer events, hourly) | "
         "Liquidity = 24h rolling volume (both pools) | "
         "NAV = $50K ÷ USR price₀ → tokens compounded daily at stUSR APY × price"
     )
