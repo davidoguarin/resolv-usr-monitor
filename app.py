@@ -143,6 +143,79 @@ def compute_nav(price_df: pd.DataFrame, apy_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ─── Trigger computation (shared across all charts + NAV summary) ─────────────
+
+def compute_triggers(
+    h_v3: pd.DataFrame,
+    h_cu: pd.DataFrame,
+    mb_h: pd.DataFrame,
+    days: int,
+) -> dict:
+    """Return the first timestamp and label for each withdrawal trigger.
+
+    Keys: "depeg", "liquidity", "mint_burn"
+    Values: (pd.Timestamp | None, description_str)
+    """
+    cutoff = DATA_END - pd.Timedelta(days=days)
+    upper  = 1.0 + DEPEG_THRESHOLD
+    lower  = 1.0 - DEPEG_THRESHOLD
+
+    # ── Depeg: first hourly close outside ±0.5% band ─────────────────────────
+    depeg_dt = None
+    depeg_label = ""
+    for df in (h_v3, h_cu):
+        if df.empty:
+            continue
+        w = df[df["datetime"] >= cutoff]
+        breach = w[(w["close"] < lower) | (w["close"] > upper)]
+        if not breach.empty:
+            t = breach["datetime"].iloc[0]
+            p = breach["close"].iloc[0]
+            if depeg_dt is None or t < depeg_dt:
+                depeg_dt    = t
+                depeg_label = f"Price ${p:.4f} (threshold ${lower:.3f})"
+
+    # ── Liquidity: 24h rolling volume doubles vs pre-window baseline ──────────
+    liq_dt    = None
+    liq_label = ""
+    if not h_v3.empty:
+        w   = h_v3[h_v3["datetime"] >= cutoff].set_index("datetime").sort_index()
+        pre = h_v3[h_v3["datetime"] < cutoff]
+        if not pre.empty:
+            baseline = pre["volume_usd"].fillna(0).sum() / max(len(pre), 1)
+        else:
+            baseline = w["volume_usd"].fillna(0).mean()
+        baseline = max(baseline, 1.0)   # avoid divide-by-zero
+
+        roll = w["volume_usd"].fillna(0).rolling("24h", min_periods=1).sum()
+        spike = roll[roll > 2 * baseline * 24]   # 2× expected 24h volume
+        if not spike.empty:
+            liq_dt    = spike.index[0]
+            liq_label = f"24h vol ${spike.iloc[0]/1e3:.0f}K (2× baseline)"
+
+    # ── Mint/Burn: hourly net outflow below threshold ─────────────────────────
+    mb_dt    = None
+    mb_label = ""
+    if not mb_h.empty:
+        mb = mb_h[mb_h["datetime"] >= cutoff]
+        neg = mb["net"][mb["net"] < 0]
+        if len(neg) > 3:
+            threshold = float(neg.mean() - 1.5 * neg.std())
+            threshold = min(threshold, -500_000)
+        else:
+            threshold = -500_000
+        breach = mb[mb["net"] < threshold]
+        if not breach.empty:
+            mb_dt    = breach["datetime"].iloc[0]
+            mb_label = f"Net burn {breach['net'].iloc[0]/1e6:.1f}M USR/h"
+
+    return {
+        "depeg":     (depeg_dt,  depeg_label),
+        "liquidity": (liq_dt,    liq_label),
+        "mint_burn": (mb_dt,     mb_label),
+    }
+
+
 # ─── Plotly layout base ───────────────────────────────────────────────────────
 
 def _base_layout(title: str, height: int = 300, yformat: str | None = None) -> dict:
@@ -190,7 +263,7 @@ def _exploit_vline(fig: go.Figure, label: bool = True) -> None:
 
 # ─── Charts ───────────────────────────────────────────────────────────────────
 
-def chart_nav(nav_df: pd.DataFrame) -> go.Figure:
+def chart_nav(nav_df: pd.DataFrame, triggers: dict) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=nav_df["date"], y=nav_df["nav"],
@@ -204,8 +277,47 @@ def chart_nav(nav_df: pd.DataFrame) -> go.Figure:
                   annotation_font_size=9, annotation_font_color="#9ca3af",
                   annotation_position="top right")
     _exploit_vline(fig)
-    fig.update_layout(**_base_layout(
-        "Portfolio NAV — $50K initial · stUSR daily compounding", height=290))
+
+    # ── Earliest-trigger annotation ───────────────────────────────────────────
+    named = {k: v for k, v in triggers.items() if v[0] is not None}
+    if named:
+        first_key = min(named, key=lambda k: named[k][0])
+        first_dt  = named[first_key][0]
+
+        # Vertical marker at earliest trigger
+        fig.add_vline(
+            x=first_dt.timestamp() * 1000,
+            line_color="#dc2626", line_width=2, line_dash="solid",
+        )
+
+        # Build multi-line summary box
+        trigger_names = {"depeg": "Depeg", "liquidity": "Liquidity", "mint_burn": "Mint/Burn"}
+        lines = ["<b>⚠ Withdrawal signals</b>"]
+        for key in ("depeg", "liquidity", "mint_burn"):
+            dt, lbl = triggers[key]
+            if dt is not None:
+                tag   = "◀ FIRST" if key == first_key else f"+{int((dt - first_dt).total_seconds()//3600)}h"
+                tname = trigger_names[key]
+                lines.append(f"{tname}: {dt.strftime('%b %d %H:%M')} UTC  {tag}")
+                lines.append(f"  {lbl}")
+        lines.append(f"<b>Exit at: {first_dt.strftime('%b %d %H:%M')} UTC</b>")
+
+        fig.add_annotation(
+            x=first_dt.timestamp() * 1000,
+            y=0.97, yref="paper",
+            text="<br>".join(lines),
+            showarrow=False,
+            font=dict(size=9.5, color="#111827", family="Inter, monospace"),
+            bgcolor="rgba(255,255,255,0.94)",
+            bordercolor="#dc2626", borderwidth=1.5,
+            borderpad=8,
+            xanchor="left", yanchor="top",
+            xshift=10,
+            align="left",
+        )
+
+    layout = _base_layout("Portfolio NAV — $50K initial · stUSR daily compounding", height=340)
+    fig.update_layout(**layout)
     fig.update_yaxes(tickprefix="$")
     return fig
 
@@ -225,21 +337,19 @@ def chart_tvl(tvl_df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def chart_depeg(h_v3: pd.DataFrame, h_cu: pd.DataFrame, days: int) -> go.Figure:
+def chart_depeg(h_v3: pd.DataFrame, h_cu: pd.DataFrame, days: int,
+                withdraw_dt: pd.Timestamp | None = None) -> go.Figure:
     upper = 1.0 + DEPEG_THRESHOLD
     lower = 1.0 - DEPEG_THRESHOLD
     cutoff = DATA_END - pd.Timedelta(days=days)
 
     def _trim(df: pd.DataFrame) -> pd.DataFrame:
-        if df.empty:
-            return df
-        return df[df["datetime"] >= cutoff].copy()
+        return df[df["datetime"] >= cutoff].copy() if not df.empty else df
 
     v3 = _trim(h_v3)
     cu = _trim(h_cu)
 
     fig = go.Figure()
-
     if not v3.empty:
         fig.add_trace(go.Scatter(
             x=v3["datetime"], y=v3["close"],
@@ -247,7 +357,6 @@ def chart_depeg(h_v3: pd.DataFrame, h_cu: pd.DataFrame, days: int) -> go.Figure:
             line=dict(color=C_USR, width=1.8),
             hovertemplate="<b>V3: $%{y:.4f}</b><extra></extra>",
         ))
-
     if not cu.empty:
         fig.add_trace(go.Scatter(
             x=cu["datetime"], y=cu["close"],
@@ -266,6 +375,23 @@ def chart_depeg(h_v3: pd.DataFrame, h_cu: pd.DataFrame, days: int) -> go.Figure:
                   annotation_position="bottom right")
     fig.add_hline(y=1.0, line_dash="dot", line_color="#9ca3af", line_width=0.7)
 
+    # "Withdraw funds" at first depeg crossing
+    if withdraw_dt is not None:
+        fig.add_vline(
+            x=withdraw_dt.timestamp() * 1000,
+            line_color="#dc2626", line_width=2, line_dash="solid",
+        )
+        fig.add_annotation(
+            x=withdraw_dt.timestamp() * 1000,
+            y=0.97, yref="paper",
+            text=f"⚠ Withdraw funds<br>{withdraw_dt.strftime('%b %d %H:%M')} UTC",
+            showarrow=False,
+            font=dict(size=9.5, color="#dc2626", family="Inter, sans-serif"),
+            bgcolor="rgba(255,255,255,0.88)",
+            bordercolor="#dc2626", borderwidth=1,
+            borderpad=6, xanchor="left", yanchor="top", xshift=6,
+        )
+
     _exploit_vline(fig)
     fig.update_layout(**_base_layout(
         "USR / USDC Price — ±0.5% withdrawal trigger bands (hourly)", height=300))
@@ -273,18 +399,20 @@ def chart_depeg(h_v3: pd.DataFrame, h_cu: pd.DataFrame, days: int) -> go.Figure:
     return fig
 
 
-def chart_liquidity(h_v3: pd.DataFrame, h_cu: pd.DataFrame, days: int) -> go.Figure:
+def chart_liquidity(h_v3: pd.DataFrame, h_cu: pd.DataFrame, days: int,
+                    withdraw_dt: pd.Timestamp | None = None,
+                    baseline_2x: float | None = None) -> go.Figure:
     cutoff = DATA_END - pd.Timedelta(days=days)
 
-    def _trim_roll(df: pd.DataFrame, label: str) -> tuple:
+    def _trim_roll(df: pd.DataFrame) -> tuple:
         if df.empty:
-            return pd.Series(dtype=float), pd.Series(dtype=float)
+            return pd.Index([]), np.array([])
         d = df[df["datetime"] >= cutoff].set_index("datetime").sort_index()
         roll = d["volume_usd"].fillna(0).rolling("24h", min_periods=1).sum() / 1e3
         return roll.index, roll.values
 
-    x_v3, y_v3 = _trim_roll(h_v3, "v3")
-    x_cu, y_cu = _trim_roll(h_cu, "curve")
+    x_v3, y_v3 = _trim_roll(h_v3)
+    x_cu, y_cu = _trim_roll(h_cu)
 
     fig = go.Figure()
     if len(x_v3):
@@ -303,14 +431,44 @@ def chart_liquidity(h_v3: pd.DataFrame, h_cu: pd.DataFrame, days: int) -> go.Fig
             fill="tozeroy", fillcolor="rgba(124,58,237,0.06)",
             hovertemplate="<b>Curve: $%{y:.1f}K (24h)</b><extra></extra>",
         ))
+
+    # 2× baseline threshold line
+    if baseline_2x is not None:
+        fig.add_hline(
+            y=baseline_2x / 1e3,
+            line_dash="dash", line_color=C_THRESH, line_width=1.2,
+            annotation_text=f"2× baseline (${baseline_2x/1e3:.0f}K)",
+            annotation_font_size=9, annotation_font_color=C_THRESH,
+            annotation_position="top right",
+        )
+
+    # "Withdraw funds" at first volume doubling
+    if withdraw_dt is not None:
+        fig.add_vline(
+            x=withdraw_dt.timestamp() * 1000,
+            line_color="#dc2626", line_width=2, line_dash="solid",
+        )
+        fig.add_annotation(
+            x=withdraw_dt.timestamp() * 1000,
+            y=0.97, yref="paper",
+            text=f"⚠ Withdraw funds<br>{withdraw_dt.strftime('%b %d %H:%M')} UTC",
+            showarrow=False,
+            font=dict(size=9.5, color="#dc2626", family="Inter, sans-serif"),
+            bgcolor="rgba(255,255,255,0.88)",
+            bordercolor="#dc2626", borderwidth=1,
+            borderpad=6, xanchor="left", yanchor="top", xshift=6,
+        )
+
     _exploit_vline(fig, label=False)
     fig.update_layout(**_base_layout(
-        "USR Pool Liquidity — 24h Rolling Volume (hourly, both pools)", height=260))
+        "USR Pool Liquidity — 24h Rolling Volume (hourly, both pools)", height=280))
     fig.update_yaxes(ticksuffix="K", tickprefix="$")
     return fig
 
 
-def chart_mint_burn(mb_hourly: pd.DataFrame, days: int) -> go.Figure:
+def chart_mint_burn(mb_hourly: pd.DataFrame, days: int,
+                    withdraw_dt: pd.Timestamp | None = None,
+                    threshold: float = -500_000) -> go.Figure:
     cutoff = DATA_END - pd.Timedelta(days=days)
     df = mb_hourly[mb_hourly["datetime"] >= cutoff].copy()
 
@@ -318,18 +476,6 @@ def chart_mint_burn(mb_hourly: pd.DataFrame, days: int) -> go.Figure:
         fig = go.Figure()
         fig.update_layout(**_base_layout("USR Mint / Burn — Hourly", height=280))
         return fig
-
-    # Threshold based on negative (outflow) hours only — ignores large mints
-    neg_flows = df["net"][df["net"] < 0]
-    if len(neg_flows) > 3:
-        threshold = float(neg_flows.mean() - 1.5 * neg_flows.std())
-        threshold = min(threshold, -500_000)   # floor: at least −500K USR/h
-    else:
-        threshold = -500_000
-
-    # Find first hour where net < threshold (withdraw signal)
-    breach = df[df["net"] < threshold]
-    withdraw_dt = breach["datetime"].iloc[0] if not breach.empty else None
 
     fig = go.Figure()
     fig.add_trace(go.Bar(
@@ -471,9 +617,31 @@ def main() -> None:
 
     st.markdown("<br>", unsafe_allow_html=True)
 
+    # ── Compute triggers (single pass, shared by all charts + NAV) ───────────
+    triggers = compute_triggers(data["h_v3"], data["h_cu"], data["mb_h"], days)
+
+    depeg_dt,  _  = triggers["depeg"]
+    liq_dt,    _  = triggers["liquidity"]
+    mb_dt,     _  = triggers["mint_burn"]
+
+    # Baseline for liquidity chart threshold line (2× expected 24h volume)
+    liq_baseline_2x: float | None = None
+    if not data["h_v3"].empty:
+        cutoff_h = DATA_END - pd.Timedelta(days=days)
+        pre = data["h_v3"][data["h_v3"]["datetime"] < cutoff_h]
+        base_hr = max(pre["volume_usd"].fillna(0).mean() if not pre.empty else 1.0, 1.0)
+        liq_baseline_2x = base_hr * 24 * 2   # 2× expected 24h volume
+
+    # mint/burn threshold value for the chart line
+    mb_threshold: float = -500_000
+    if not data["mb_h"].empty:
+        mb_cut = data["mb_h"][data["mb_h"]["datetime"] >= DATA_END - pd.Timedelta(days=days)]
+        neg = mb_cut["net"][mb_cut["net"] < 0]
+        if len(neg) > 3:
+            mb_threshold = min(float(neg.mean() - 1.5 * neg.std()), -500_000)
+
     # ── Charts ────────────────────────────────────────────────────────────────
-    # NAV — daily granularity across full history always; window filters display
-    st.plotly_chart(chart_nav(nav_w), use_container_width=True,
+    st.plotly_chart(chart_nav(nav_w, triggers), use_container_width=True,
                     config={"displayModeBar": False})
 
     col_l, col_r = st.columns(2)
@@ -481,14 +649,19 @@ def main() -> None:
         st.plotly_chart(chart_tvl(tvl_w), use_container_width=True,
                         config={"displayModeBar": False})
     with col_r:
-        st.plotly_chart(chart_liquidity(data["h_v3"], data["h_cu"], days),
-                        use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(
+            chart_liquidity(data["h_v3"], data["h_cu"], days,
+                            withdraw_dt=liq_dt, baseline_2x=liq_baseline_2x),
+            use_container_width=True, config={"displayModeBar": False})
 
-    st.plotly_chart(chart_depeg(data["h_v3"], data["h_cu"], days),
-                    use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(
+        chart_depeg(data["h_v3"], data["h_cu"], days, withdraw_dt=depeg_dt),
+        use_container_width=True, config={"displayModeBar": False})
 
-    st.plotly_chart(chart_mint_burn(data["mb_h"], days),
-                    use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(
+        chart_mint_burn(data["mb_h"], days,
+                        withdraw_dt=mb_dt, threshold=mb_threshold),
+        use_container_width=True, config={"displayModeBar": False})
 
     # ── Footer ────────────────────────────────────────────────────────────────
     st.markdown("---")
