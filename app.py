@@ -1,5 +1,5 @@
 """
-Resolv USR Strategy Monitor — Streamlit Dashboard
+Resolv USR Strategy Monitoring System — Streamlit Dashboard
 ==================================================
 Simulates a $50K allocation to Resolv USR / stUSR over 6 months
 (Oct 1 2025 → Apr 1 2026) and tracks protocol risk metrics.
@@ -20,7 +20,7 @@ from pathlib import Path
 
 # ─── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Resolv USR Monitor",
+    page_title="Resolv USR Strategy Monitoring System",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -68,7 +68,7 @@ INITIAL_INVESTMENT = 50_000.0
 DEPEG_THRESHOLD    = 0.010          # ±1.0%
 EXPLOIT_DATE       = pd.Timestamp("2026-03-22", tz="UTC")
 DATA_END           = pd.Timestamp("2026-03-24 23:59", tz="UTC")
-CENTER             = pd.Timestamp("2026-03-22 12:00", tz="UTC")   # window centre
+CENTER             = pd.Timestamp("2026-03-22 00:00", tz="UTC")   # window centre (midnight UTC)
 
 C_USR    = "#ea580c"
 C_CURVE  = "#7c3aed"
@@ -82,9 +82,9 @@ C_EXPL   = "#6366f1"
 DATA_DIR = Path("data/cached")
 
 WINDOWS = {
-    "24 Hours":  1,   # Mar 21 12:00 – Mar 23 12:00
-    "48 Hours":  2,   # Mar 20 12:00 – Mar 24 12:00
-    "1 Week":    7,   # Mar 15 12:00 – Mar 29 12:00
+    "24 Hours":  1,   # Mar 21 12:00 – Mar 22 12:00 UTC (centre Mar 22 00:00)
+    "48 Hours":  2,   # Mar 21 00:00 – Mar 23 00:00 UTC
+    "1 Week":    7,   # Mar 18 12:00 – Mar 25 12:00 UTC
 }
 
 
@@ -588,7 +588,7 @@ def kpi_card(label: str, value: str, delta: str = "", dtype: str = "neu") -> str
 
 def main() -> None:
     # ── Header ──────────────────────────────────────────────────────────────
-    st.title("Resolv USR Strategy Monitor")
+    st.title("Resolv USR Strategy Monitoring System")
     st.caption("$50K allocation · stUSR yield compounding · Oct 2025 – Apr 2026")
 
     # ── Load & compute ───────────────────────────────────────────────────────
@@ -622,7 +622,7 @@ def main() -> None:
         idx = (nav_hourly["datetime"] - first_trigger_dt).abs().idxmin()
         nav_at_withdrawal = float(nav_hourly.loc[idx, "nav"])
 
-    # ── Window-filtered slices (centered on Mar 22 12:00 UTC) ────────────────
+    # ── Window-filtered slices (centered on Mar 22 00:00 UTC) ────────────────
     half   = pd.Timedelta(hours=days * 12)
     w_low  = CENTER - half
     w_high = CENTER + half
