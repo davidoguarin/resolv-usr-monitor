@@ -212,6 +212,80 @@ def fetch_usr_price_daily() -> pd.DataFrame:
     return df
 
 
+# ─── 3b. USR/USDC Hourly OHLCV for 1W / 3W views (GeckoTerminal) ────────────
+
+# 3 weeks of hourly data ending Apr 1, 2026
+TS_HOURLY_START = 1773187200   # Mar 11, 2026 00:00 UTC
+TS_HOURLY_LIMIT = 514          # 504 h (21 days) + buffer
+
+
+def _fetch_pool_hourly(pool_address: str, label: str) -> pd.DataFrame:
+    """Fetch hourly OHLCV from GeckoTerminal for a single pool."""
+    url = (
+        f"{GECKO_BASE}/networks/eth/pools/{pool_address}/ohlcv/hour"
+        f"?aggregate=1&before_timestamp={TS_END + 3600}&limit={TS_HOURLY_LIMIT}"
+        f"&currency=usd&token=base"
+    )
+    try:
+        data = _get(url, headers=GECKO_HDR)
+    except Exception as exc:
+        log.warning("[%s] GeckoTerminal error: %s", label, exc)
+        return pd.DataFrame()
+
+    candles = data.get("data", {}).get("attributes", {}).get("ohlcv_list", [])
+    if not candles:
+        log.warning("[%s] No hourly candles returned.", label)
+        return pd.DataFrame()
+
+    rows = []
+    for ts, open_, high, low, close, volume in candles:
+        ts = int(ts)
+        if ts >= TS_HOURLY_START:
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            rows.append({
+                "datetime":   dt.isoformat(),
+                "timestamp":  ts,
+                "open":       float(open_),
+                "high":       float(high),
+                "low":        float(low),
+                "close":      float(close),
+                "volume_usd": float(volume),
+                "pool":       label,
+            })
+
+    df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+    log.info("  [%s] %d hourly candles.", label, len(df))
+    return df
+
+
+def fetch_usr_price_hourly() -> tuple[pd.DataFrame, pd.DataFrame]:
+    out_v3    = OUT_DIR / "usr_price_hourly_v3.csv"
+    out_curve = OUT_DIR / "usr_price_hourly_curve.csv"
+
+    if out_v3.exists() and out_curve.exists():
+        log.info("Hourly CSVs already cached — skipping.")
+        return (pd.read_csv(out_v3, parse_dates=["datetime"]),
+                pd.read_csv(out_curve, parse_dates=["datetime"]))
+
+    log.info("Fetching hourly OHLCV from GeckoTerminal ...")
+
+    df_v3 = _fetch_pool_hourly(USR_POOL_V3, "uniswap_v3")
+    if not df_v3.empty:
+        df_v3.to_csv(out_v3, index=False)
+
+    # Curve USR/USDC pool — may return 403 if not indexed on free tier
+    curve_pool = "0x3ee841f47947fefbe510366e4bbb49e145484195"
+    df_curve = _fetch_pool_hourly(curve_pool, "curve")
+    if not df_curve.empty:
+        df_curve.to_csv(out_curve, index=False)
+    else:
+        # Save empty placeholder so we don't retry on each app load
+        pd.DataFrame(columns=["datetime", "timestamp", "open", "high", "low",
+                               "close", "volume_usd", "pool"]).to_csv(out_curve, index=False)
+
+    return df_v3, df_curve
+
+
 # ─── 4. USR Mint / Burn (Etherscan Transfer events) ──────────────────────────
 
 def _decode_transfer_amount(data_hex: str, decimals: int = 18) -> float:
@@ -341,6 +415,7 @@ def main() -> None:
     fetch_resolv_tvl()
     fetch_usr_apy()
     fetch_usr_price_daily()
+    fetch_usr_price_hourly()
     fetch_usr_mint_burn()
 
     log.info("All done — cached files in %s/", OUT_DIR)
