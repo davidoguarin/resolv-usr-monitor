@@ -68,6 +68,7 @@ INITIAL_INVESTMENT = 50_000.0
 DEPEG_THRESHOLD    = 0.010          # ±1.0%
 EXPLOIT_DATE       = pd.Timestamp("2026-03-22", tz="UTC")
 DATA_END           = pd.Timestamp("2026-03-24 23:59", tz="UTC")
+CENTER             = pd.Timestamp("2026-03-22 12:00", tz="UTC")   # window centre
 
 C_USR    = "#ea580c"
 C_CURVE  = "#7c3aed"
@@ -81,9 +82,9 @@ C_EXPL   = "#6366f1"
 DATA_DIR = Path("data/cached")
 
 WINDOWS = {
-    "24 Hours":  1,   # Mar 23–24
-    "48 Hours":  2,   # Mar 22–24
-    "1 Week":    7,   # Mar 17–24
+    "24 Hours":  1,   # Mar 21 12:00 – Mar 23 12:00
+    "48 Hours":  2,   # Mar 20 12:00 – Mar 24 12:00
+    "1 Week":    7,   # Mar 15 12:00 – Mar 29 12:00
 }
 
 
@@ -195,7 +196,9 @@ def compute_triggers(
     Keys: "depeg", "liquidity", "mint_burn"
     Values: (pd.Timestamp | None, description_str)
     """
-    cutoff = DATA_END - pd.Timedelta(days=days)
+    half   = pd.Timedelta(hours=days * 12)
+    w_low  = CENTER - half
+    w_high = CENTER + half
     upper  = 1.0 + DEPEG_THRESHOLD
     lower  = 1.0 - DEPEG_THRESHOLD
 
@@ -205,7 +208,7 @@ def compute_triggers(
     for df in (h_v3, h_cu):
         if df.empty:
             continue
-        w = df[df["datetime"] >= cutoff]
+        w = df[(df["datetime"] >= w_low) & (df["datetime"] <= w_high)]
         breach = w[(w["close"] < lower) | (w["close"] > upper)]
         if not breach.empty:
             t = breach["datetime"].iloc[0]
@@ -218,7 +221,7 @@ def compute_triggers(
     liq_dt    = None
     liq_label = ""
     if not h_v3.empty:
-        w    = h_v3[h_v3["datetime"] >= cutoff].set_index("datetime").sort_index()
+        w    = h_v3[(h_v3["datetime"] >= w_low) & (h_v3["datetime"] <= w_high)].set_index("datetime").sort_index()
         roll = w["volume_usd"].fillna(0).rolling("24h", min_periods=1).sum()
         prev = roll.shift(1).fillna(0)
         # Trigger: rolling sum ≥$5K AND more than doubles from previous hour
@@ -235,7 +238,7 @@ def compute_triggers(
     mb_dt    = None
     mb_label = ""
     if not mb_h.empty:
-        mb = mb_h[mb_h["datetime"] >= cutoff]
+        mb = mb_h[(mb_h["datetime"] >= w_low) & (mb_h["datetime"] <= w_high)]
         neg = mb["net"][mb["net"] < 0]
         if len(neg) > 3:
             threshold = float(neg.mean() - 1.5 * neg.std())
@@ -383,10 +386,12 @@ def chart_depeg(h_v3: pd.DataFrame, h_cu: pd.DataFrame, days: int,
                 withdraw_dt: pd.Timestamp | None = None) -> go.Figure:
     upper = 1.0 + DEPEG_THRESHOLD
     lower = 1.0 - DEPEG_THRESHOLD
-    cutoff = DATA_END - pd.Timedelta(days=days)
+    half  = pd.Timedelta(hours=days * 12)
+    w_low  = CENTER - half
+    w_high = CENTER + half
 
     def _trim(df: pd.DataFrame) -> pd.DataFrame:
-        return df[df["datetime"] >= cutoff].copy() if not df.empty else df
+        return df[(df["datetime"] >= w_low) & (df["datetime"] <= w_high)].copy() if not df.empty else df
 
     v3 = _trim(h_v3)
     cu = _trim(h_cu)
@@ -443,12 +448,14 @@ def chart_depeg(h_v3: pd.DataFrame, h_cu: pd.DataFrame, days: int,
 
 def chart_liquidity(h_v3: pd.DataFrame, h_cu: pd.DataFrame, days: int,
                     withdraw_dt: pd.Timestamp | None = None) -> go.Figure:
-    cutoff = DATA_END - pd.Timedelta(days=days)
+    half   = pd.Timedelta(hours=days * 12)
+    w_low  = CENTER - half
+    w_high = CENTER + half
 
     def _trim_roll(df: pd.DataFrame) -> tuple:
         if df.empty:
             return pd.Index([]), np.array([])
-        d = df[df["datetime"] >= cutoff].set_index("datetime").sort_index()
+        d = df[(df["datetime"] >= w_low) & (df["datetime"] <= w_high)].set_index("datetime").sort_index()
         roll = d["volume_usd"].fillna(0).rolling("24h", min_periods=1).sum() / 1e3
         return roll.index, roll.values
 
@@ -500,8 +507,10 @@ def chart_liquidity(h_v3: pd.DataFrame, h_cu: pd.DataFrame, days: int,
 def chart_mint_burn(mb_hourly: pd.DataFrame, days: int,
                     withdraw_dt: pd.Timestamp | None = None,
                     threshold: float = -500_000) -> go.Figure:
-    cutoff = DATA_END - pd.Timedelta(days=days)
-    df = mb_hourly[mb_hourly["datetime"] >= cutoff].copy()
+    half   = pd.Timedelta(hours=days * 12)
+    w_low  = CENTER - half
+    w_high = CENTER + half
+    df = mb_hourly[(mb_hourly["datetime"] >= w_low) & (mb_hourly["datetime"] <= w_high)].copy()
 
     if df.empty:
         fig = go.Figure()
@@ -613,14 +622,17 @@ def main() -> None:
         idx = (nav_hourly["datetime"] - first_trigger_dt).abs().idxmin()
         nav_at_withdrawal = float(nav_hourly.loc[idx, "nav"])
 
-    # ── Window-filtered slices ────────────────────────────────────────────────
-    cutoff_daily  = DATA_END - pd.Timedelta(days=days)
-    cutoff_hourly = DATA_END - pd.Timedelta(days=days)
+    # ── Window-filtered slices (centered on Mar 22 12:00 UTC) ────────────────
+    half      = pd.Timedelta(hours=days * 12)
+    w_low     = CENTER - half
+    w_high    = CENTER + half
+    w_low_d   = w_low.date()
+    w_high_d  = w_high.date()
 
-    nav_h_w = nav_hourly[nav_hourly["datetime"] >= cutoff_hourly]
-    price_w = data["price"][data["price"]["date"] >= cutoff_daily]
-    apy_w   = data["apy"][data["apy"]["date"]   >= cutoff_daily]
-    tvl_w   = data["tvl"][data["tvl"]["date"]   >= cutoff_daily]
+    nav_h_w = nav_hourly[(nav_hourly["datetime"] >= w_low) & (nav_hourly["datetime"] <= w_high)]
+    price_w = data["price"][(data["price"]["date"] >= w_low_d) & (data["price"]["date"] <= w_high_d)]
+    apy_w   = data["apy"][(data["apy"]["date"]   >= w_low_d) & (data["apy"]["date"]   <= w_high_d)]
+    tvl_w   = data["tvl"][(data["tvl"]["date"]   >= w_low_d) & (data["tvl"]["date"]   <= w_high_d)]
 
     cur_nav   = float(nav_h_w["nav"].iloc[-1])   if len(nav_h_w) else INITIAL_INVESTMENT
     peak_nav  = float(nav_daily["nav"].max())     # full-history peak
@@ -687,7 +699,7 @@ def main() -> None:
     # mint/burn threshold value for the chart line
     mb_threshold: float = -500_000
     if not data["mb_h"].empty:
-        mb_cut = data["mb_h"][data["mb_h"]["datetime"] >= DATA_END - pd.Timedelta(days=days)]
+        mb_cut = data["mb_h"][(data["mb_h"]["datetime"] >= w_low) & (data["mb_h"]["datetime"] <= w_high)]
         neg = mb_cut["net"][mb_cut["net"] < 0]
         if len(neg) > 3:
             mb_threshold = min(float(neg.mean() - 1.5 * neg.std()), -500_000)
